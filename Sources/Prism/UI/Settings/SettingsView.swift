@@ -2,6 +2,8 @@ import AppKit
 import Carbon
 import SwiftUI
 
+/// User-editable shortcuts: global hotkeys (each with a primary and an optional secondary binding)
+/// and the window drag gestures. Changes are saved immediately and re-registered.
 final class PrismSettings: ObservableObject {
     static let shared = PrismSettings()
     struct Shortcut: Identifiable {
@@ -9,37 +11,53 @@ final class PrismSettings: ObservableObject {
         let name: String
         let binding: HotKeys.Binding
         let active: Bool
+        var secondary: HotKeys.Binding?
+        var secondaryActive = true
+    }
+    /// Which binding of which shortcut is being recorded.
+    struct Slot: Equatable {
+        let name: String
+        let secondary: Bool
     }
     @Published var shortcuts: [Shortcut] = []
-    @Published var recording: String?
+    @Published var recording: Slot?
     @Published var feedback = ""
+    @Published private(set) var dragBindings = DragBindings.load()
     var reloadShortcuts: (() -> Void)?
     var menuChanged: (() -> Void)?
     private var monitor: Any?
-    private let storageKey = DefaultsKey.customShortcuts
 
-    func saved(_ name: String) -> HotKeys.Binding? {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let values = try? JSONDecoder().decode([String: HotKeys.Binding].self, from: data) else { return nil }
-        return values[name]
+    // MARK: Global shortcuts
+
+    /// The user's binding for a shortcut's slot; nil means the default (primary) or none (secondary).
+    func saved(_ name: String, secondary: Bool = false) -> HotKeys.Binding? {
+        Self.load(secondary)[name]
     }
 
-    private func save(_ binding: HotKeys.Binding?, for name: String) {
-        let data = UserDefaults.standard.data(forKey: storageKey) ?? Data()
-        var values = (try? JSONDecoder().decode([String: HotKeys.Binding].self, from: data)) ?? [:]
-        values[name] = binding
-        if let encoded = try? JSONEncoder().encode(values) { UserDefaults.standard.set(encoded, forKey: storageKey) }
+    private func save(_ binding: HotKeys.Binding?, for slot: Slot) {
+        var values = Self.load(slot.secondary)
+        values[slot.name] = binding
+        if let encoded = try? JSONEncoder().encode(values) { UserDefaults.standard.set(encoded, forKey: Self.key(slot.secondary)) }
     }
 
-    func record(_ name: String) {
+    private static func key(_ secondary: Bool) -> String { secondary ? DefaultsKey.secondaryShortcuts : DefaultsKey.customShortcuts }
+
+    private static func load(_ secondary: Bool) -> [String: HotKeys.Binding] {
+        guard let data = UserDefaults.standard.data(forKey: key(secondary)),
+              let values = try? JSONDecoder().decode([String: HotKeys.Binding].self, from: data) else { return [:] }
+        return values
+    }
+
+    func record(_ name: String, secondary: Bool = false) {
         cancelRecording()
+        let slot = Slot(name: name, secondary: secondary)
         feedback = "Press a shortcut with ⌘, ⌥ or ⌃. Esc cancels."
-        recording = name
+        recording = slot
         // Let existing Prism shortcuts be captured without triggering their actions.
         HotKeys.shared.unregisterAll()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            if event.keyCode == 53 { self.cancelRecording(); return nil }
+            if event.keyCode == KeyCode.escape { self.cancelRecording(); return nil }
             let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
             guard !flags.intersection([.command, .option, .control]).isEmpty else {
                 self.feedback = "Include Command, Option or Control in the shortcut."
@@ -57,24 +75,35 @@ final class PrismSettings: ObservableObject {
             let special: [UInt16: String] = [49: "Space", 36: "↩", 48: "Tab", 51: "⌫", 123: "←", 124: "→", 125: "↓", 126: "↑"]
             let label = special[event.keyCode] ?? event.charactersIgnoringModifiers?.uppercased() ?? "Key \(event.keyCode)"
             let binding = HotKeys.Binding(keyCode: UInt32(event.keyCode), modifiers: modifiers, label: label)
-            if let duplicate = self.shortcuts.first(where: { $0.name != name && $0.binding.keyCode == binding.keyCode && $0.binding.modifiers == binding.modifiers }) {
-                self.feedback = "Already assigned to \(duplicate.name). Choose another shortcut."
+            if let owner = self.owner(of: binding, except: slot) {
+                self.feedback = "Already assigned to \(owner). Choose another shortcut."
                 return nil
             }
-            let previous = self.saved(name)
+            let previous = self.saved(name, secondary: secondary)
             self.endRecording()
-            self.save(binding, for: name)
+            self.save(binding, for: slot)
             self.reloadShortcuts?()
-            if self.shortcuts.first(where: { $0.name == name })?.active != true {
-                self.save(previous, for: name)
+            let shortcut = self.shortcuts.first { $0.name == name }
+            if (secondary ? shortcut?.secondaryActive : shortcut?.active) != true {
+                self.save(previous, for: slot)
                 self.reloadShortcuts?()
                 self.feedback = "Shortcut unavailable. Your previous shortcut was restored."
             } else {
-                self.feedback = "\(name) is now \(binding.display)."
+                self.feedback = "\(name) is now \(binding.display)\(secondary ? " (secondary)" : "")."
             }
             self.menuChanged?()
             return nil
         }
+    }
+
+    /// The shortcut already using these keys in any slot other than `slot`.
+    private func owner(of binding: HotKeys.Binding, except slot: Slot) -> String? {
+        func same(_ other: HotKeys.Binding?) -> Bool { other?.keyCode == binding.keyCode && other?.modifiers == binding.modifiers }
+        for shortcut in shortcuts {
+            if same(shortcut.binding), slot != Slot(name: shortcut.name, secondary: false) { return shortcut.name }
+            if same(shortcut.secondary), slot != Slot(name: shortcut.name, secondary: true) { return shortcut.name }
+        }
+        return nil
     }
 
     private func endRecording() {
@@ -90,12 +119,50 @@ final class PrismSettings: ObservableObject {
         feedback = "Shortcut change canceled."
     }
 
+    func clearSecondary(_ name: String) {
+        cancelRecording()
+        save(nil, for: Slot(name: name, secondary: true))
+        reloadShortcuts?()
+        menuChanged?()
+        feedback = "Removed the secondary shortcut for \(name)."
+    }
+
+    /// Back to the default: the original primary keys and no secondary.
     func reset(_ name: String) {
         cancelRecording()
-        save(nil, for: name)
+        save(nil, for: Slot(name: name, secondary: false))
+        save(nil, for: Slot(name: name, secondary: true))
         reloadShortcuts?()
         menuChanged?()
         feedback = "Default shortcut restored for \(name)."
+    }
+
+    // MARK: Window drag gestures
+
+    /// Sets one slot of a drag gesture; nil clears a secondary. Refuses a gesture another slot already uses.
+    func setDrag(_ binding: DragBinding?, for action: DragAction, secondary: Bool) {
+        if let binding {
+            for (other, slots) in dragBindings {
+                if slots.primary == binding, (other, false) != (action, secondary) { feedback = "\(binding.display) already does \(other.title)."; return }
+                if slots.secondary == binding, (other, true) != (action, secondary) { feedback = "\(binding.display) already does \(other.title)."; return }
+            }
+        }
+        var slots = dragBindings[action] ?? DragSlots()
+        if secondary { slots.secondary = binding } else { slots.primary = binding }
+        dragBindings[action] = slots
+        applyDragBindings()
+        feedback = binding.map { "\(action.title) is now \($0.display)\(secondary ? " (secondary)" : "")." } ?? "Removed the secondary gesture for \(action.title)."
+    }
+
+    func resetDrag(_ action: DragAction) {
+        dragBindings[action] = DragBindings.defaults[action]
+        applyDragBindings()
+        feedback = "Default gestures restored for \(action.title)."
+    }
+
+    private func applyDragBindings() {
+        DragBindings.save(dragBindings)
+        AppServices.shared.windowDragger.reload()
     }
 }
 
@@ -241,7 +308,7 @@ private struct ExtensionsPane: View {
             Section {
                 Toggle(isOn: $windowDragging) {
                     Text("Window Dragging")
-                    Text("Hold ⌃⌘ and drag anywhere on screen to move the active window. Hold ⌃⌘ and right-drag to resize it from its center.")
+                    Text("Hold modifier keys and drag anywhere on screen to move or resize the active window. By default ⌃⌘ drag moves, and ⌃⌘ right-drag or ⌃⌥ drag resizes. Change them in Keyboard Shortcuts.")
                 }
                 .onChange(of: windowDragging) { _, _ in AppServices.shared.windowDragger.reload() }
                 Toggle(isOn: $windowShortcuts) {
@@ -277,23 +344,35 @@ private struct ShortcutsPane: View {
                 ForEach(settings.shortcuts) { shortcut in
                     LabeledContent {
                         HStack(spacing: 6) {
-                            Button(settings.recording == shortcut.name ? "Press keys…" : shortcut.binding.display) { settings.record(shortcut.name) }
-                                .monospaced().frame(minWidth: 96)
-                                .accessibilityLabel("Change shortcut for \(shortcut.name)")
-                                .accessibilityValue(shortcut.binding.display)
-                            Button { settings.reset(shortcut.name) } label: { Image(systemName: "arrow.counterclockwise") }
-                                .buttonStyle(.borderless)
-                                .help("Restore default shortcut")
-                                .accessibilityLabel("Restore default shortcut for \(shortcut.name)")
+                            keysButton(shortcut.name, binding: shortcut.binding, secondary: false)
+                            secondaryButton(shortcut)
+                            resetButton("Restore default shortcut", for: shortcut.name) { settings.reset(shortcut.name) }
                         }
                     } label: {
                         Text(shortcut.name)
                         if !shortcut.active { Text("Unavailable — choose another shortcut").foregroundStyle(.orange) }
+                        if shortcut.secondary != nil, !shortcut.secondaryActive { Text("Secondary unavailable — choose another").foregroundStyle(.orange) }
                     }
                 }
             } header: {
-                Text("Click a shortcut, then press the new keys. Changes are saved automatically.")
+                Text("Click a shortcut, then press the new keys. Click None to add a secondary shortcut. Changes are saved automatically.")
                     .font(.callout).fontWeight(.regular).foregroundStyle(.secondary)
+            }
+            Section {
+                ForEach(DragAction.allCases) { action in
+                    let slots = settings.dragBindings[action] ?? DragSlots()
+                    LabeledContent {
+                        HStack(spacing: 6) {
+                            dragPicker(action, current: slots.primary, secondary: false)
+                            dragPicker(action, current: slots.secondary, secondary: true)
+                            resetButton("Restore default gestures", for: action.title) { settings.resetDrag(action) }
+                        }
+                    } label: {
+                        Text(action.title)
+                    }
+                }
+            } header: {
+                Text("Window Gestures")
             } footer: {
                 VStack(alignment: .trailing, spacing: 6) {
                     if !settings.feedback.isEmpty { Text(settings.feedback).foregroundStyle(.secondary) }
@@ -301,6 +380,53 @@ private struct ShortcutsPane: View {
                 }
             }
         }
+    }
+
+    private func keysButton(_ name: String, binding: HotKeys.Binding, secondary: Bool) -> some View {
+        let recording = settings.recording == PrismSettings.Slot(name: name, secondary: secondary)
+        return Button(recording ? "Press keys…" : binding.display) { settings.record(name, secondary: secondary) }
+            .monospaced().frame(minWidth: 96)
+            .accessibilityLabel("Change \(secondary ? "secondary " : "")shortcut for \(name)")
+            .accessibilityValue(binding.display)
+    }
+
+    @ViewBuilder private func secondaryButton(_ shortcut: PrismSettings.Shortcut) -> some View {
+        if let secondary = shortcut.secondary {
+            keysButton(shortcut.name, binding: secondary, secondary: true)
+            Button { settings.clearSecondary(shortcut.name) } label: { Image(systemName: "minus.circle") }
+                .buttonStyle(.borderless)
+                .help("Remove secondary shortcut")
+                .accessibilityLabel("Remove secondary shortcut for \(shortcut.name)")
+        } else {
+            let recording = settings.recording == PrismSettings.Slot(name: shortcut.name, secondary: true)
+            Button(recording ? "Press keys…" : "None") { settings.record(shortcut.name, secondary: true) }
+                .foregroundStyle(.secondary).frame(minWidth: 96)
+                .help("Add a secondary shortcut")
+                .accessibilityLabel("Add secondary shortcut for \(shortcut.name)")
+        }
+    }
+
+    private func dragPicker(_ action: DragAction, current: DragBinding?, secondary: Bool) -> some View {
+        Menu(current?.display ?? "None") {
+            if secondary {
+                Button("None") { settings.setDrag(nil, for: action, secondary: true) }
+                Divider()
+            }
+            ForEach(DragBinding.choices, id: \.self) { choice in
+                Button(choice.display) { settings.setDrag(choice, for: action, secondary: secondary) }
+            }
+        }
+        .monospaced()
+        .fixedSize()
+        .frame(minWidth: 96)
+        .accessibilityLabel("\(secondary ? "Secondary" : "Primary") gesture for \(action.title)")
+    }
+
+    private func resetButton(_ help: String, for name: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: "arrow.counterclockwise") }
+            .buttonStyle(.borderless)
+            .help(help)
+            .accessibilityLabel("\(help) for \(name)")
     }
 }
 

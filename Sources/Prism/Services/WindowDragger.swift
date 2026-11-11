@@ -4,15 +4,14 @@ import os
 
 private let log = Logger(subsystem: "app.local.prism", category: "drag")
 
-/// Hold ⌃⌘ and drag anywhere on screen to move the active window; ⌃⌘ right-drag resizes it around its center,
-/// moving all four corners at once.
+/// Hold modifiers and drag anywhere on screen to move the active window, or resize it around its center, moving all
+/// four corners at once. The gestures come from `DragBindings`: by default ⌃⌘ drag moves, and ⌃⌘ right-drag or
+/// ⌃⌥ drag resizes (the ⌃⌥ form works on trackpads without secondary click).
 /// An active session event tap swallows the modified clicks so the app underneath never sees them. Taps run on
 /// their own thread and Accessibility calls run on a serial queue, so neither Prism's main thread nor a slow app
 /// can stall clicks system-wide. Approach adapted from easy-move-resize (MIT, Daniel Marcotte).
 final class WindowDragger {
     static var enabled: Bool { UserDefaults.standard.object(forKey: DefaultsKey.windowDragging) as? Bool ?? true }
-    private static let modifiers: CGEventFlags = [.maskControl, .maskCommand]
-    private static let relevantFlags: CGEventFlags = [.maskControl, .maskCommand, .maskAlternate, .maskShift]
     private static let minimumSize = CGSize(width: 100, height: 50)
 
     private enum Kind { case move, resize }
@@ -35,6 +34,8 @@ final class WindowDragger {
     private var keyTap: CFMachPort?
     private var mouseTap: CFMachPort?
     private var dragging: Kind?
+    /// The button that started the drag; its drag and up events belong to the session.
+    private var dragButton: CGMouseButton = .left
     // Owned by `queue`.
     private let queue = DispatchQueue(label: "app.local.prism.window-drag", qos: .userInteractive)
     private var session: Session?
@@ -44,6 +45,8 @@ final class WindowDragger {
     private var flushScheduled = false
     // The active app, tracked from workspace notifications; guarded by `lock` (written on main, read on `queue`).
     private var frontPID: pid_t = 0
+    // The gestures in use, in priority order; guarded by `lock` (written on main, read on the event thread).
+    private var bindings: [(binding: DragBinding, kind: Kind)] = []
 
     func start() {
         // The system-wide AXFocusedApplication query fails intermittently, so track the active app directly.
@@ -66,12 +69,17 @@ final class WindowDragger {
     }
 
     func reload() {
+        let slots = DragBindings.load()
+        let list = (slots[.move]?.all ?? []).map { ($0, Kind.move) } + (slots[.resize]?.all ?? []).map { ($0, Kind.resize) }
+        lock.lock()
+        bindings = list
+        lock.unlock()
         let wanted = Self.enabled && Accessibility.trusted
         if wanted, eventRunLoop == nil { startEventThread() } else if !wanted, eventRunLoop != nil { stopEventThread() }
     }
 
     /// A high-priority thread with a listen-only tap for modifier changes. It installs the active mouse tap the
-    /// moment ⌃⌘ goes down, without waiting on Prism's main thread, which macOS deprioritizes in the background.
+    /// moment a gesture's modifiers go down, without waiting on Prism's main thread, which macOS deprioritizes in the background.
     /// A listen-only tap can't hold up input, so it's safe to keep around.
     private func startEventThread() {
         let ready = DispatchSemaphore(value: 0)
@@ -114,7 +122,21 @@ final class WindowDragger {
 
     // MARK: Event thread
 
-    private static func held(_ flags: CGEventFlags) -> Bool { flags.intersection(relevantFlags) == modifiers }
+    /// Whether the held modifiers belong to some gesture, so clicks may need intercepting.
+    private func held(_ flags: CGEventFlags) -> Bool {
+        let pressed = flags.intersection(DragBinding.relevantFlags).rawValue
+        lock.lock()
+        defer { lock.unlock() }
+        return bindings.contains { $0.binding.modifiers == pressed }
+    }
+
+    /// The gesture a press starts, if any.
+    private func kind(for flags: CGEventFlags, button: DragBinding.Button) -> Kind? {
+        let press = DragBinding(flags, button)
+        lock.lock()
+        defer { lock.unlock() }
+        return bindings.first { $0.binding == press }?.kind
+    }
 
     private func handleKey(_ type: CGEventType, _ event: CGEvent) {
         switch type {
@@ -122,14 +144,14 @@ final class WindowDragger {
             log.notice("key tap disabled (\(type.rawValue)); re-enabling")
             if let keyTap { CGEvent.tapEnable(tap: keyTap, enable: true) }
         case .flagsChanged:
-            log.notice("flags \(event.flags.rawValue, format: .hex) held=\(Self.held(event.flags)) tap=\(self.mouseTap != nil) dragging=\(self.dragging != nil)")
-            if Self.held(event.flags) { installMouseTap() } else if dragging == nil { removeMouseTap() }
+            log.notice("flags \(event.flags.rawValue, format: .hex) held=\(self.held(event.flags)) tap=\(self.mouseTap != nil) dragging=\(self.dragging != nil)")
+            if held(event.flags) { installMouseTap() } else if dragging == nil { removeMouseTap() }
         default:
             break
         }
     }
 
-    /// The active tap that swallows ⌃⌘ clicks. It only exists while ⌃⌘ is held or a drag is in progress: an active
+    /// The active tap that swallows gesture clicks. It only exists while a gesture's modifiers are held or a drag is in progress: an active
     /// tap whose Accessibility access is revoked can freeze all input.
     private func installMouseTap() {
         guard mouseTap == nil else { return }
@@ -179,27 +201,28 @@ final class WindowDragger {
                 dragging = nil
                 queue.async { self.end() }
             }
-            log.notice("mouse down \(type.rawValue) flags \(event.flags.rawValue, format: .hex) held=\(Self.held(event.flags)) wasDragging=\(self.dragging != nil)")
-            guard Self.held(event.flags) else { return pass }
-            let kind: Kind = type == .leftMouseDown ? .move : .resize
+            log.notice("mouse down \(type.rawValue) flags \(event.flags.rawValue, format: .hex) held=\(self.held(event.flags)) wasDragging=\(self.dragging != nil)")
+            let left = type == .leftMouseDown
+            guard let kind = kind(for: event.flags, button: left ? .left : .right) else { return pass }
             let point = event.location
             dragging = kind
+            dragButton = left ? .left : .right
             queue.async { self.begin(kind, at: point) }
             return nil
         case .leftMouseDragged, .rightMouseDragged:
             // Keep swallowing even if the modifiers are released mid-drag, so the app never sees half a click.
-            guard let kind = dragging, (kind == .move) == (type == .leftMouseDragged) else { return pass }
+            guard dragging != nil, (dragButton == .left) == (type == .leftMouseDragged) else { return pass }
             schedule(event.location)
             return nil
         case .leftMouseUp, .rightMouseUp:
-            guard let kind = dragging, (kind == .move) == (type == .leftMouseUp) else { return pass }
+            guard dragging != nil, (dragButton == .left) == (type == .leftMouseUp) else { return pass }
             dragging = nil
             schedule(event.location)
             queue.async { self.end() }
             // If the keys were released mid-drag, drop the tap now that the drag is over (after this callback returns).
-            if !Self.held(event.flags) {
+            if !held(event.flags) {
                 CFRunLoopPerformBlock(CFRunLoopGetCurrent(), CFRunLoopMode.commonModes.rawValue) { [self] in
-                    if dragging == nil, !Self.held(CGEventSource.flagsState(.combinedSessionState)) { removeMouseTap() }
+                    if dragging == nil, !held(CGEventSource.flagsState(.combinedSessionState)) { removeMouseTap() }
                 }
             }
             return nil

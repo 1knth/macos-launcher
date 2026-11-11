@@ -20,9 +20,9 @@ make test       # unit tests for PrismCore (calculator, ranking, parsers, transf
 | ⌃⌥P | Pick color from screen |
 | ⌃⌥⌘E | Emoji picker |
 | ⌃⌥ ← → ↑ ↓ ↩ C ⌫ D F G | Window halves, maximize, center, restore, thirds |
-| ⌃⌘ drag / ⌃⌘ right-drag | Move / resize the active window, from anywhere on screen |
+| ⌃⌘ drag / ⌃⌥ drag (or ⌃⌘ right-drag) | Move / resize the active window, from anywhere on screen |
 
-Open **Settings** with **⌘,** while the launcher is open, the footer gear, or the menu bar. Turn extensions (Window Dragging, Window Shortcuts, Clipboard History) on or off, record new global shortcuts, restore defaults, and check Accessibility and Screen Recording access. Shortcut changes apply immediately and persist across launches; unavailable shortcuts keep the previous binding.
+Open **Settings** with **⌘,** while the launcher is open, the footer gear, or the menu bar. Turn extensions (Window Dragging, Window Shortcuts, Clipboard History) on or off, record new global shortcuts with an optional secondary shortcut each (none by default), choose the window move and resize gestures, restore defaults, and check Accessibility and Screen Recording access. Shortcut changes apply immediately and persist across launches; unavailable shortcuts keep the previous binding.
 
 Every open starts at the home search with an empty field. On an empty search, ↑ brings back your last search (keep pressing for older ones). Inside the launcher: ↑↓ to move, ↩ for the primary action, ⌘↩ for the secondary action, ⌘K for every action, Esc to go back, ⌘W to close. Window shortcuts can be turned off with `defaults write app.local.prism windowShortcuts -bool false`.
 
@@ -47,7 +47,7 @@ Every open starts at the home search with an empty field. On an empty search, �
 - **Clipboard history**: text, links, images, files and colors with a preview pane. It supports paste, paste as plain text, pin and OCR on copied images. Password-manager copies are skipped. ⌘K lets you pause recording.
 - **Color wheel and picker**: HEX, RGB, HSL, HSB and SwiftUI formats, harmonies, shades, WCAG contrast and saved colors.
 - **OCR**: Clippy's capture pipeline (ScreenCaptureKit and Vision). It also runs on image files and clipboard images.
-- **Window Dragging**: hold ⌃⌘ and drag anywhere on screen to move the active window, or right-drag to resize it around its center, moving all four corners at once. The click never reaches the app underneath. Needs Accessibility access.
+- **Window Dragging**: hold ⌃⌘ and drag anywhere on screen to move the active window. Hold ⌃⌘ and right-drag, or ⌃⌥ and drag (the default secondary gesture, for trackpads without right click), to resize it around its center, moving all four corners at once. The click never reaches the app underneath. Both gestures can be changed in Settings → Keyboard Shortcuts. Needs Accessibility access.
 - **Extras**: window management, timers (`timer 25m tea`), Keep Awake, web search keywords (`g`, `ddg`, `yt`, `gh`, `wiki`, `maps`, `npm`, `so`, `r`), opening URLs directly, `quit <app>`, UUID and password generators, lorem ipsum, `roll 2d20`, coin flip, lock, sleep, empty trash, appearance toggle, hidden files, eject, and open at login.
 
 ## Code

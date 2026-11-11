@@ -25,7 +25,13 @@ final class GlobalShortcuts {
                 registered = hotKeys.register(fallback, action)
             }
             if registered { active.append((name, selected.display)) }
-            settings.shortcuts.append(.init(name: name, binding: selected, active: registered))
+            var shortcut = PrismSettings.Shortcut(name: name, binding: selected, active: registered)
+            // Secondary bindings are opt-in: none exist until recorded in Settings.
+            if let secondary = settings.saved(name, secondary: true) {
+                shortcut.secondary = secondary
+                shortcut.secondaryActive = hotKeys.register(secondary, action)
+            }
+            settings.shortcuts.append(shortcut)
         }
         // ⌥Space is taken while Raycast or Alfred run; fall back to ⌘⇧Space.
         add("Open Prism", key(kVK_Space, optionKey, "Space"), fallback: key(kVK_Space, cmdKey | shiftKey, "Space")) { services.launcher?.toggle() }

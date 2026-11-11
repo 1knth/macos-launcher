@@ -7,9 +7,11 @@ enum DefaultsKey {
     static let launchedBefore = "launchedBefore"
     static let launcherCenter = "launcherCenter"
     static let customShortcuts = "customShortcuts"
+    static let secondaryShortcuts = "secondaryShortcuts"
     // Extensions
     static let windowShortcuts = "windowShortcuts"
     static let windowDragging = "windowDragging"
+    static let dragBindings = "dragBindings"
     static let clipboardPaused = "clipboardPaused"
     // Ranking
     static let frecency = "frecency"
